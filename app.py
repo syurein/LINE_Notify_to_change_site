@@ -290,7 +290,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
                 channel_token_input = gr.Textbox(label="LINE Channel Access Token", type="password", placeholder="LINE Developersコンソールから発行した長期トークン")
                 user_id_input = gr.Textbox(label="LINE User ID", placeholder="あなたのユーザーID (Uから始まる文字列)")
                 with gr.Row():
-                    interval_input = gr.Slider(minimum=400, maximum=600, value=600, step=10, label="監視間隔 (秒)")
+                    interval_input = gr.Slider(minimum=400, maximum=60000, value=600, step=10, label="監視間隔 (秒)")
                     mode_input = gr.Radio(
                         ["通常モード (ページ全体)", "エルメスモード (特定要素)"], 
                         label="監視モード", 
