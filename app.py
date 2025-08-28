@@ -109,19 +109,30 @@ def perform_scrape_and_check(target: dict, page: Page):
     new_content = ""
     try:
         page.goto(url, wait_until='domcontentloaded', timeout=60000)
-        
+        time.sleep(10) # ページ描画のための共通待機時間
+
         if mode == "エルメスモード (特定要素)":
-            time.sleep(10)
             elements = page.locator('div.product-item').all_text_contents()
             new_content = "\n".join(line.strip() for el in elements for line in el.strip().split('\n') if line.strip())
         elif mode == "メルカリモード (商品リスト)":
-            time.sleep(10)
             elements = page.locator('[class*="imageContainer"]').evaluate_all(
                 "(elements) => elements.map(e => e.getAttribute('aria-label'))"
             )
-            new_content = "\n".join(elements)
+            new_content = "\n".join(item.strip() for item in elements if item and item.strip())
+        elif mode == "Amazonモード (aria-label)":
+            elements = page.locator('div[aria-label]').evaluate_all(
+                "(elements) => elements.map(el => el.getAttribute('aria-label'))"
+            )
+            new_content = "\n".join(item.strip() for item in elements if item and item.strip())
+        elif mode == "楽天モード (a-title)":
+            elements = page.locator('a[title]').evaluate_all(
+                "(elements) => elements.map(el => el.getAttribute('title'))"
+            )
+            new_content = "\n".join(item.strip() for item in elements if item and item.strip())
+        elif mode == "Yahooショッピングモード (span-content)":
+            elements = page.locator('span[class*="SearchResultItemTitle"]').all_text_contents()
+            new_content = "\n".join(item.strip() for item in elements if item and item.strip())
         else: # 通常モード
-            time.sleep(10)
             new_content = page.locator('body').text_content()
             
         site_name = url.split('/')[2]
@@ -135,7 +146,7 @@ def perform_scrape_and_check(target: dict, page: Page):
                 message = f"【監視開始】\nサイト「{site_name}」の監視を開始しました。\n{url}"
                 if attach_content:
                     content_summary = ""
-                    if mode in ["メルカリモード (商品リスト)", "エルメスモード (特定要素)"] and new_content:
+                    if mode not in ["通常モード (ページ全体)"] and new_content:
                         content_summary = f"\n\n--- 現在のアイテム一覧 ---\n{new_content}"
                     message = f"【監視開始】\nサイト「{site_name}」の監視を開始しました。{content_summary}\n\n{url}"
                 send_long_message(channel_token, user_id, message)
@@ -179,7 +190,7 @@ def perform_scrape_and_check(target: dict, page: Page):
                 message = f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。\n{url}"
                 if attach_content:
                     summary_for_no_change = ""
-                    if mode in ["メルカリモード (商品リスト)", "エルメスモード (特定要素)"] and new_content:
+                    if mode not in ["通常モード (ページ全体)"] and new_content:
                         top_items = "\n".join(new_content.split('\n')[:5])
                         summary_for_no_change = f"\n\n--- 最新上位5件 ---\n{top_items}"
                     message = f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。{summary_for_no_change}\n\n{url}"
@@ -367,7 +378,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
                 with gr.Row():
                     interval_input = gr.Slider(minimum=10, maximum=1800, value=600, step=10, label="監視間隔 (秒)")
                     mode_input = gr.Radio(
-                        ["通常モード (ページ全体)", "エルメスモード (特定要素)", "メルカリモード (商品リスト)"], 
+                        ["通常モード (ページ全体)", "エルメスモード (特定要素)", "メルカリモード (商品リスト)", "Amazonモード (aria-label)", "楽天モード (a-title)", "Yahooショッピングモード (span-content)"], 
                         label="監視モード", 
                         value="通常モード (ページ全体)"
                     )
