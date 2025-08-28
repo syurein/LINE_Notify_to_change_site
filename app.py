@@ -4,28 +4,32 @@ import requests
 import threading
 import json
 import os
+import difflib
 from playwright.sync_api import sync_playwright, Page
 import pandas as pd
 from datetime import datetime
 
 # --- JSONデータベース設定 ---
 DB_FILE = "monitoring_db.json"
+db_lock = threading.Lock() # データベースファイルへのアクセスを制御するためのロック
 
 # --- JSONファイル操作関数 ---
 def load_targets():
     """JSONファイルから監視リストを読み込む"""
-    if not os.path.exists(DB_FILE):
-        return []
-    try:
-        with open(DB_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return []
+    with db_lock: # ロックを取得
+        if not os.path.exists(DB_FILE):
+            return []
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
 
 def save_targets(targets):
     """監視リストをJSONファイルに保存する"""
-    with open(DB_FILE, 'w', encoding='utf-8') as f:
-        json.dump(targets, f, indent=4, ensure_ascii=False)
+    with db_lock: # ロックを取得
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
+            json.dump(targets, f, indent=4, ensure_ascii=False)
 
 def init_json_db():
     """JSONデータベースファイルを初期化する"""
@@ -39,37 +43,55 @@ app_state = {
 
 # --- LINE Messaging APIへの通知機能 ---
 def send_message(channel_token, user_id, message):
-    """指定されたユーザーにLINE Messaging API経由でプッシュメッセージを送信する"""
+    """単一のテキストメッセージをLINE Messaging API経由で送信する"""
     push_api_url = 'https://api.line.me/v2/bot/message/push'
-    
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {channel_token}'
     }
-    
     payload = {
         'to': user_id,
         'messages': [{'type': 'text', 'text': message}]
     }
-
     try:
         response = requests.post(push_api_url, headers=headers, json=payload)
         response.raise_for_status()
-        return f"LINEメッセージを送信しました。\n"
+        return f"LINEメッセージの送信成功"
     except Exception as e:
-        return f"LINEメッセージの送信に失敗しました: {e}\n"
+        return f"LINEメッセージの送信に失敗: {e}"
+
+def send_long_message(channel_token, user_id, message):
+    """長文メッセージを分割して送信する"""
+    global app_state
+    max_length = 4800  # LINEのAPI制限より少し短く設定
+    full_log = ""
+
+    if len(message) <= max_length:
+        log = send_message(channel_token, user_id, message)
+        full_log += log + "\n"
+    else:
+        # メッセージを分割
+        parts = [message[i:i+max_length] for i in range(0, len(message), max_length)]
+        for i, part in enumerate(parts):
+            # 分割したことを示すヘッダーを追加
+            part_header = f"【{i+1}/{len(parts)}】\n"
+            log = send_message(channel_token, user_id, part_header + part)
+            full_log += log + "\n"
+            time.sleep(1) # API制限を避けるための短い待機
+            
+    app_state["log_history"] += full_log
+    return full_log
+
 
 # --- 個別のURLをチェックする関数 ---
-### ★★★ 修正点1: 取得内容を通知するロジックを追加 ---
 def perform_scrape_and_check(target: dict, page: Page):
     """単一のターゲットURLをスクレイピングし、変更をチェックして新しい内容を返す"""
     global app_state
     url = target['url']
     mode = target['mode']
-    last_content = target.get('last_content')
+    last_content = target.get('last_content', '') # Noneではなく空文字をデフォルトに
     notify_on_check = target.get('notify_on_check', False)
-    # 新しいオプションを取得（存在しない場合はFalse）
-    send_content = target.get('send_content', False)
+    attach_content = target.get('attach_content', False) # 新しいオプションを取得
     
     channel_token = target.get('channel_token')
     user_id = target.get('user_id')
@@ -81,49 +103,87 @@ def perform_scrape_and_check(target: dict, page: Page):
     new_content = ""
     try:
         page.goto(url, wait_until='domcontentloaded', timeout=60000)
-
-        if mode == "エルメスモード (特定要素)":
-            # サイトの構造変更に対応するため、より広い範囲の要素を取得
-            elements = page.locator('div.product-item').all_text_contents()
-            # 空白や改行を整理して結合
-            new_content = "\n".join(line.strip() for el in elements for line in el.strip().split('\n') if line.strip())
-        else:
-            new_content = page.locator('body').text_content()
         
+        if mode == "エルメスモード (特定要素)":
+            time.sleep(10)
+            elements = page.locator('div.product-item').all_text_contents()
+            new_content = "\n".join(line.strip() for el in elements for line in el.strip().split('\n') if line.strip())
+        elif mode == "メルカリモード (商品リスト)":
+            time.sleep(10)
+            elements = page.locator('[class*="imageContainer"]').evaluate_all(
+                "(elements) => elements.map(e => e.getAttribute('aria-label'))"
+            )
+            new_content = "\n".join(elements)
+        else: # 通常モード
+            time.sleep(10)
+            new_content = page.locator('body').text_content()
+
+        with open("debug_full_page.txt", "w", encoding="utf-8") as f:
+            f.write(new_content or "")
+            
         site_name = url.split('/')[2]
         
-        # メッセージに取得内容を追記する共通ロジック
-        def append_content_if_needed(base_message):
-            if mode == "エルメスモード (特定要素)" and send_content and new_content:
-                return base_message + f"\n\n--- 取得内容 ---\n{new_content}"
-            return base_message
-
-        if last_content is None:
+        # last_contentがNoneの場合の初回実行
+        if target.get('last_content') is None:
             log_message = f"初回コンテンツ取得: {url}\n"
             print(log_message)
             app_state["log_history"] += log_message
             if notify_on_check:
-                message = append_content_if_needed(f"【監視開始】\nサイト「{site_name}」の監視を開始しました。\n{url}")
-                notification_log = send_message(channel_token, user_id, message)
-                app_state["log_history"] += notification_log
+                message = f"【監視開始】\nサイト「{site_name}」の監視を開始しました。\n{url}"
+                if attach_content:
+                    content_summary = ""
+                    if mode in ["メルカリモード (商品リスト)", "エルメスモード (特定要素)"] and new_content:
+                        content_summary = f"\n\n--- 現在のアイテム一覧 ---\n{new_content}"
+                    message = f"【監視開始】\nサイト「{site_name}」の監視を開始しました。{content_summary}\n\n{url}"
+                send_long_message(channel_token, user_id, message)
 
         elif last_content != new_content:
             log_message = f"変更を検知！: {url}\n"
             print(log_message)
             app_state["log_history"] += log_message
-            message = append_content_if_needed(f"【更新通知】\nサイト「{site_name}」で変化を検知しました！\nすぐに確認してください！\n{url}")
-            notification_log = send_message(channel_token, user_id, message)
-            app_state["log_history"] += notification_log
+            
+            message = f"【更新通知】\nサイト「{site_name}」で変化を検知しました！\nすぐに確認してください！\n{url}"
+            if attach_content:
+                old_lines = last_content.splitlines()
+                new_lines = new_content.splitlines()
+                diff = difflib.unified_diff(
+                    old_lines, new_lines, fromfile='変更前', tofile='変更後', lineterm=''
+                )
+                # --- と +++ ヘッダー行を除き、実際の変更行のみを抽出
+                diff_lines = [line for line in diff if line.startswith('+') or line.startswith('-')][2:]
+                diff_output = "\n".join(diff_lines)
+
+                if not diff_output:
+                    message = (
+                        f"【更新通知】\nサイト「{site_name}」で変更を検知しました（差分表示なし）。\n\n"
+                        f"--- 変更前 ---\n{last_content}\n\n"
+                        f"--- 変更後 ---\n{new_content}\n\n"
+                        f"すぐに確認してください！\n{url}"
+                    )
+                else:
+                    message = (
+                        f"【更新通知】\nサイト「{site_name}」で変化を検知しました！\n\n"
+                        f"--- 変更箇所 ---\n{diff_output}\n\n"
+                        f"すぐに確認してください！\n{url}"
+                    )
+            send_long_message(channel_token, user_id, message)
+
         else:
             log_message = f"変更なし: {url}\n"
             print(log_message)
             app_state["log_history"] += log_message
             if notify_on_check:
-                message = append_content_if_needed(f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。\n{url}")
-                notification_log = send_message(channel_token, user_id, message)
-                app_state["log_history"] += notification_log
+                message = f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。\n{url}"
+                if attach_content:
+                    summary_for_no_change = ""
+                    if mode in ["メルカリモード (商品リスト)", "エルメスモード (特定要素)"] and new_content:
+                        top_items = "\n".join(new_content.split('\n')[:5])
+                        summary_for_no_change = f"\n\n--- 最新上位5件 ---\n{top_items}"
+                    message = f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。{summary_for_no_change}\n\n{url}"
+                send_long_message(channel_token, user_id, message)
         
         return new_content
+
 
     except Exception as e:
         log_message = f"エラー発生 ({url}): {e}\n"
@@ -140,49 +200,58 @@ def master_monitoring_loop():
     app_state["log_history"] += log_message
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True) # 通常はヘッドレスで実行
         context = browser.new_context(
              user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         )
         
         try:
             while True:
-                all_targets = load_targets()
-                db_updated = False
-                
+                # チェックが必要なターゲットのリストを取得
                 targets_to_check = [
-                    t for t in all_targets 
+                    t for t in load_targets()
                     if time.time() - t.get('last_checked', 0) > t['interval']
                 ]
 
                 for target in targets_to_check:
                     page = context.new_page()
                     try:
+                        # スクレイピング処理（時間がかかる可能性がある）
                         new_content = perform_scrape_and_check(target, page)
                         
-                        target_in_all = next((t for t in all_targets if t['id'] == target['id']), None)
-                        if not target_in_all:
+                        # --- 競合回避のための修正 ---
+                        # 1. スクレイピング完了後、DBから最新のリストを再度読み込む
+                        all_targets_now = load_targets()
+                        
+                        # 2. 最新のリストから更新対象のアイテムを探す
+                        target_to_update = next((t for t in all_targets_now if t['id'] == target['id']), None)
+
+                        # 3. アイテムが見つからない場合：
+                        #    スクレイピング中にUIから削除されたことを意味するので、何もしない
+                        if not target_to_update:
+                            log_message = f"ID {target['id']} はチェック中に削除されたため、更新をスキップします。\n"
+                            print(log_message)
+                            app_state["log_history"] += log_message
                             continue
 
-                        target_in_all['last_checked'] = time.time()
-                        db_updated = True
-
+                        # 4. アイテムが見つかった場合、更新する
+                        target_to_update['last_checked'] = time.time()
                         if new_content is not None:
-                            target_in_all['last_content'] = new_content
-                    
+                            target_to_update['last_content'] = new_content
+                        
+                        # 5. 更新後のリスト全体をDBに保存する
+                        save_targets(all_targets_now)
+
                     finally:
                         page.close()
 
-                if db_updated:
-                    save_targets(all_targets)
-
+                # 次のチェックサイクルまで待機
                 time.sleep(5)
         finally:
             browser.close()
 
 # --- Gradio UIイベントハンドラ ---
-### ★★★ 修正点2: 引数と保存するデータにsend_contentを追加 ---
-def add_target(url, channel_token, user_id, interval, mode, notify_on_check, send_content):
+def add_target(url, channel_token, user_id, interval, mode, notify_on_check, attach_content):
     """監視対象をJSONに追加する"""
     if not all([url, channel_token, user_id, interval, mode]):
         gr.Warning("すべてのフィールドを入力してください。")
@@ -207,7 +276,7 @@ def add_target(url, channel_token, user_id, interval, mode, notify_on_check, sen
         "mode": mode,
         "interval": int(interval),
         "notify_on_check": notify_on_check,
-        "send_content": send_content, # 新しいオプションを保存
+        "attach_content": attach_content, # オプションを保存
         "last_content": None,
         "last_checked": 0
     }
@@ -223,45 +292,49 @@ def delete_target_by_id(target_id_to_delete):
         gr.Warning("削除するIDを入力してください。")
         return get_targets_as_dataframe()
     
-    target_id_to_delete = int(target_id_to_delete)
+    try:
+        target_id_to_delete_int = int(target_id_to_delete)
+    except (ValueError, TypeError):
+        gr.Warning("IDは数値で入力してください。")
+        return get_targets_as_dataframe()
+        
     targets = load_targets()
     
-    new_targets = [t for t in targets if t['id'] != target_id_to_delete]
+    new_targets = [t for t in targets if t['id'] != target_id_to_delete_int]
     
     if len(new_targets) == len(targets):
-        gr.Warning(f"ID {target_id_to_delete} が見つかりませんでした。")
+        gr.Warning(f"ID {target_id_to_delete_int} が見つかりませんでした。")
     else:
         save_targets(new_targets)
-        gr.Info(f"ID {target_id_to_delete} を削除しました。")
+        gr.Info(f"ID {target_id_to_delete_int} を削除しました。")
         
     return get_targets_as_dataframe()
 
-### ★★★ 修正点3: DataFrameに「内容通知」列を追加 ---
 def get_targets_as_dataframe():
     """JSONから現在の監視リストを取得し、DataFrameとして返す"""
     targets = load_targets()
     if not targets:
-        return pd.DataFrame(columns=['ID', 'URL', 'モード', '間隔(秒)', '最終チェック日時', '毎回通知', '内容通知'])
+        return pd.DataFrame(columns=['ID', 'URL', 'モード', '間隔(秒)', '最終チェック日時', '毎回通知', '内容を添付'])
 
     df = pd.DataFrame(targets)
-    # 古いデータに新しい列がない場合でもエラーにならないように対策
+    # 古いデータとの互換性
     if 'notify_on_check' not in df.columns:
         df['notify_on_check'] = False
-    if 'send_content' not in df.columns:
-        df['send_content'] = False
+    if 'attach_content' not in df.columns:
+        df['attach_content'] = False
 
-    df = df[['id', 'url', 'mode', 'interval', 'last_checked', 'notify_on_check', 'send_content']]
+    df = df[['id', 'url', 'mode', 'interval', 'last_checked', 'notify_on_check', 'attach_content']]
     df['last_checked'] = df['last_checked'].apply(
         lambda ts: datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts > 0 else "未チェック"
     )
     df['notify_on_check'] = df['notify_on_check'].apply(lambda x: "はい" if x else "いいえ")
-    df['send_content'] = df['send_content'].apply(lambda x: "はい" if x else "いいえ")
+    df['attach_content'] = df['attach_content'].apply(lambda x: "はい" if x else "いいえ")
     
     df.rename(columns={
         'id':'ID', 'url':'URL', 'mode':'モード', 
         'interval':'間隔(秒)', 'last_checked':'最終チェック日時',
         'notify_on_check': '毎回通知',
-        'send_content': '内容通知' # 新しい列名
+        'attach_content': '内容を添付'
     }, inplace=True)
     return df
 
@@ -271,7 +344,6 @@ def get_logs():
     return "\n".join(log_lines[-50:])
 
 # --- Gradio UIの構築 ---
-### ★★★ 修正点4: UIにチェックボックスを追加 ---
 with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
     gr.Markdown("# Webサイト更新通知ツール (Messaging API版)")
     gr.Markdown("複数の監視対象を登録でき、ブラウザを閉じても監視を継続します。")
@@ -283,22 +355,23 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
                 value=get_targets_as_dataframe, 
                 interactive=False
             )
-            refresh_btn = gr.Button("リストを更新")
+            refresh_btn = gr.Button("リストを手動更新")
             
             with gr.Accordion("新しい監視対象を追加", open=True):
                 url_input = gr.Textbox(label="監視対象URL", placeholder="https://www.hermes.com/jp/ja/...")
                 channel_token_input = gr.Textbox(label="LINE Channel Access Token", type="password", placeholder="LINE Developersコンソールから発行した長期トークン")
                 user_id_input = gr.Textbox(label="LINE User ID", placeholder="あなたのユーザーID (Uから始まる文字列)")
                 with gr.Row():
-                    interval_input = gr.Slider(minimum=400, maximum=60000, value=600, step=10, label="監視間隔 (秒)")
+                    interval_input = gr.Slider(minimum=10, maximum=1800, value=600, step=10, label="監視間隔 (秒)")
                     mode_input = gr.Radio(
-                        ["通常モード (ページ全体)", "エルメスモード (特定要素)"], 
+                        ["通常モード (ページ全体)", "エルメスモード (特定要素)", "メルカリモード (商品リスト)"], 
                         label="監視モード", 
                         value="通常モード (ページ全体)"
                     )
-                notify_on_check_input = gr.Checkbox(label="チェックするたびにLINEで通知する")
-                # 新しいチェックボックスを追加
-                send_content_input = gr.Checkbox(label="エルメスモードの場合、取得した内容も通知する")
+                with gr.Row():
+                    notify_on_check_input = gr.Checkbox(label="チェック毎に通知する")
+                    attach_content_input = gr.Checkbox(label="通知に内容を添付する", value=True) # UIにチェックボックスを追加
+                
                 add_btn = gr.Button("リストに追加", variant="primary")
 
             with gr.Accordion("監視対象を削除", open=False):
@@ -307,32 +380,47 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
 
         with gr.Column(scale=1):
             gr.Markdown("### 実行ログ")
-            log_output = gr.Textbox(label=" ", lines=20, interactive=False, autoscroll=True)
+            log_output = gr.Textbox(label=" ", lines=25, interactive=False, autoscroll=True)
 
     # イベントリスナー
-    # inputsにsend_content_inputを追加
     add_btn.click(
         fn=add_target,
-        inputs=[url_input, channel_token_input, user_id_input, interval_input, mode_input, notify_on_check_input, send_content_input],
+        inputs=[url_input, channel_token_input, user_id_input, interval_input, mode_input, notify_on_check_input, attach_content_input],
         outputs=[targets_display]
     )
     delete_btn.click(fn=delete_target_by_id, inputs=[delete_id_input], outputs=[targets_display])
     refresh_btn.click(fn=get_targets_as_dataframe, inputs=None, outputs=[targets_display])
     
+    # --- 定期的な更新処理 ---
+    # 2秒ごとにログを更新
     gr.Timer(2).tick(get_logs, None, log_output)
+    # 10秒ごとに監視リストのDataFrameを更新
+    gr.Timer(10).tick(get_targets_as_dataframe, None, targets_display)
+
 
 # --- アプリケーションの起動 ---
 if __name__ == "__main__":
-    if not os.path.exists(os.path.expanduser('~/.cache/ms-playwright')):
+    # Playwrightのブラウザがインストールされているか確認し、なければインストール
+    # この部分はローカル環境で一度実行すれば十分です
+    if not os.path.exists(os.path.join(os.path.expanduser('~'), '.cache', 'ms-playwright')):
         print("Playwrightのブラウザをインストールします...")
-        os.system('playwright install')
-        print("インストールが完了しました。")
+        try:
+            # subprocessを使用してplaywright installを実行
+            import subprocess
+            subprocess.run(["playwright", "install"], check=True)
+            print("インストールが完了しました。")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Playwrightのインストールに失敗しました: {e}")
+            print("手動で 'pip install playwright' と 'playwright install' を実行してください。")
+            exit(1)
 
     print("JSONデータベースを初期化します...")
     init_json_db()
     print("初期化が完了しました。")
 
+    # バックグラウンドで監視スレッドを開始
     monitor_thread = threading.Thread(target=master_monitoring_loop, daemon=True)
     monitor_thread.start()
     
-    app.launch(server_name="0.0.0.0", server_port=int(os.getenv('PORT', 7860)))
+    # Gradioアプリを起動
+    app.launch()
