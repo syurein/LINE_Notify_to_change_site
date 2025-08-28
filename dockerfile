@@ -44,6 +44,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 # システムライブラリはインストール済みなので、ブラウザ本体だけをインストール
 RUN playwright install chromium
 
+# --- ▼▼▼ ここから追加 ▼▼▼ ---
+
+# データ永続化用のディレクトリパスを環境変数として設定
+ENV DATA_DIR /data
+
+# データディレクトリを作成
+RUN mkdir -p $DATA_DIR
+
+# /data ディレクトリをボリュームとして指定
+VOLUME $DATA_DIR
+
+# --- ▲▲▲ ここまで追加 ▲▲▲ ---
+
+
 # 残りのアプリケーションコードをコピー
 COPY . .
 
