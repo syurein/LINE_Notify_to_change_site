@@ -214,7 +214,7 @@ def master_monitoring_loop():
     app_state["log_history"] += log_message
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False) # 通常はヘッドレスで実行
+        browser = p.chromium.launch(headless=True) # 通常はヘッドレスで実行
         context = browser.new_context(
              user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         )
