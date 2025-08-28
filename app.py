@@ -8,9 +8,15 @@ import difflib
 from playwright.sync_api import sync_playwright, Page
 import pandas as pd
 from datetime import datetime
+import subprocess
 
 # --- JSONデータベース設定 ---
-DB_FILE = "monitoring_db.json"
+# Dockerボリュームにデータを永続化するための設定
+# 環境変数 'DATA_DIR' で永続化するディレクトリを指定（デフォルトは '/data'）
+DATA_DIR = os.environ.get('DATA_DIR', '/data')
+# ディレクトリが存在しない場合は作成
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.path.join(DATA_DIR, "monitoring_db.json")
 db_lock = threading.Lock() # データベースファイルへのアクセスを制御するためのロック
 
 # --- JSONファイル操作関数 ---
@@ -117,9 +123,6 @@ def perform_scrape_and_check(target: dict, page: Page):
         else: # 通常モード
             time.sleep(10)
             new_content = page.locator('body').text_content()
-
-        with open("debug_full_page.txt", "w", encoding="utf-8") as f:
-            f.write(new_content or "")
             
         site_name = url.split('/')[2]
         
@@ -325,7 +328,7 @@ def get_targets_as_dataframe():
 
     df = df[['id', 'url', 'mode', 'interval', 'last_checked', 'notify_on_check', 'attach_content']]
     df['last_checked'] = df['last_checked'].apply(
-        lambda ts: datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts > 0 else "未チェック"
+        lambda ts: datetime.fromtimestamp(ts).strftime('%Y-m-%d %H:%M:%S') if ts > 0 else "未チェック"
     )
     df['notify_on_check'] = df['notify_on_check'].apply(lambda x: "はい" if x else "いいえ")
     df['attach_content'] = df['attach_content'].apply(lambda x: "はい" if x else "いいえ")
@@ -400,19 +403,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
 
 # --- アプリケーションの起動 ---
 if __name__ == "__main__":
-    # Playwrightのブラウザがインストールされているか確認し、なければインストール
-    # この部分はローカル環境で一度実行すれば十分です
-    if not os.path.exists(os.path.join(os.path.expanduser('~'), '.cache', 'ms-playwright')):
-        print("Playwrightのブラウザをインストールします...")
-        try:
-            # subprocessを使用してplaywright installを実行
-            import subprocess
-            subprocess.run(["playwright", "install"], check=True)
-            print("インストールが完了しました。")
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"Playwrightのインストールに失敗しました: {e}")
-            print("手動で 'pip install playwright' と 'playwright install' を実行してください。")
-            exit(1)
+    # Docker環境では、PlaywrightのインストールはDockerfileで行うため、
+    # このPythonスクリプト内でのインストール処理は不要です。
 
     print("JSONデータベースを初期化します...")
     init_json_db()
@@ -422,5 +414,20 @@ if __name__ == "__main__":
     monitor_thread = threading.Thread(target=master_monitoring_loop, daemon=True)
     monitor_thread.start()
     
-    # Gradioアプリを起動
-    app.launch()
+    # --- Dockerのための起動設定 ---
+    # Dockerfileと合わせて、以下のコマンドでコンテナを起動します。
+    # 1. イメージのビルド:
+    #    docker build -t web-monitor-app .
+    #
+    # 2. コンテナの起動 (データ永続化のためボリュームを使用):
+    #    docker run -d -p 7860:7860 -v "$(pwd)/my_data:/data" --name web-monitor web-monitor-app
+    #    - "-d": バックグラウンドで実行
+    #    - "-p 7860:7860": ホストのポート7860をコンテナのポート7860にマッピング
+    #    - "-v "$(pwd)/my_data:/data"": ホストのカレントディレクトリ下の'my_data'フォルダを
+    #      コンテナの'/data'ディレクトリにマッピングします。
+    #      'my_data'フォルダは自動で作成されます。ここに'monitoring_db.json'が保存されます。
+    
+    print("Gradioアプリを起動します...")
+    # コンテナ内で外部からのアクセスを受け付けるために server_name="0.0.0.0" を指定
+    # ポートはGradioのデフォルト(7860)を使用
+    app.launch(server_name="0.0.0.0", server_port=int(os.getenv('PORT', 7860)))
