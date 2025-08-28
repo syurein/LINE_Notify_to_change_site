@@ -2,6 +2,20 @@
 
 登録したWebサイトを定期的に巡回し、ページの更新を検知してLINEに通知を送るアプリケーションです。
 
+## Renderでのデプロイ (推奨)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+このアプリケーションは、Webサービスホスティングプラットフォームの[Render](https://render.com/)に簡単にデプロイできます。
+
+1.  上の「Deploy to Render」ボタンをクリックします。
+2.  あなたのGitHubアカウントと連携し、このリポジトリをフォーク（コピー）して新しいリポジトリを作成します。
+3.  Renderの画面で、作成したリポジトリを選択し、サービス名（例: `web-update-notifier`）を決定します。
+4.  **「Create Web Service」** をクリックすると、自動でデプロイが開始されます。
+5.  デプロイが完了すると、あなた専用のURLが発行されます。監視リストは永続化されるため、ブラウザを閉じても安心です。
+
+---
+
 ## 主な機能
 
 - 複数のURLを監視対象として登録

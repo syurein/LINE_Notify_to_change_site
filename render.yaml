@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: web-update-notifier
+    runtime: docker
+    dockerfilePath: ./dockerfile
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: PORT
+        value: 7860
+    dockerCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 0 app:app
+    disks:
+      - name: data
+        mountPath: /data
+        sizeGB: 1
