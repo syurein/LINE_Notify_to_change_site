@@ -120,7 +120,7 @@ def perform_scrape_and_check(target: dict, page: Page):
             )
             new_content = "\n".join(item.strip() for item in elements if item and item.strip())
         elif mode == "Amazonモード (aria-label)":
-            elements = page.locator('div[aria-label]').evaluate_all(
+            elements = page.locator('h2[class*="a-size-mini a-spacing-none a-color-base s-line-clamp-2"]').evaluate_all(
                 "(elements) => elements.map(el => el.getAttribute('aria-label'))"
             )
             new_content = "\n".join(item.strip() for item in elements if item and item.strip())
@@ -214,7 +214,7 @@ def master_monitoring_loop():
     app_state["log_history"] += log_message
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True) # 通常はヘッドレスで実行
+        browser = p.chromium.launch(headless=False) # 通常はヘッドレスで実行
         context = browser.new_context(
              user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         )
