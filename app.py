@@ -11,18 +11,16 @@ from datetime import datetime
 import subprocess
 
 # --- JSONデータベース設定 ---
-# Dockerボリュームにデータを永続化するための設定
-# 環境変数 'DATA_DIR' で永続化するディレクトリを指定（デフォルトは '/data'）
 DATA_DIR = os.environ.get('DATA_DIR', '/data')
-# ディレクトリが存在しない場合は作成
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "monitoring_db.json")
-db_lock = threading.Lock() # データベースファイルへのアクセスを制御するためのロック
+SETTINGS_FILE = os.path.join(DATA_DIR, "app_settings.json")
+db_lock = threading.Lock()
 
 # --- JSONファイル操作関数 ---
 def load_targets():
     """JSONファイルから監視リストを読み込む"""
-    with db_lock: # ロックを取得
+    with db_lock:
         if not os.path.exists(DB_FILE):
             return []
         try:
@@ -33,23 +31,58 @@ def load_targets():
 
 def save_targets(targets):
     """監視リストをJSONファイルに保存する"""
-    with db_lock: # ロックを取得
+    with db_lock:
         with open(DB_FILE, 'w', encoding='utf-8') as f:
             json.dump(targets, f, indent=4, ensure_ascii=False)
+
+def load_settings():
+    """アプリ設定を読み込む"""
+    if not os.path.exists(SETTINGS_FILE):
+        return {"channel_token": "", "user_id": ""}
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {"channel_token": "", "user_id": ""}
+
+def save_settings(settings):
+    """アプリ設定を保存する"""
+    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, indent=4, ensure_ascii=False)
 
 def init_json_db():
     """JSONデータベースファイルを初期化する"""
     if not os.path.exists(DB_FILE):
         save_targets([])
+    if not os.path.exists(SETTINGS_FILE):
+        save_settings({"channel_token": "", "user_id": ""})
 
 # --- グローバル変数 ---
 app_state = {
-    "log_history": "アプリを起動しました。\n"
+    "log_history": "",
+    "monitoring_active": True
 }
 
+# --- ロギング機能の改善 ---
+def log_message(message, level="INFO"):
+    """タイムスタンプ付きのログメッセージを追加"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"[{timestamp}] [{level}] {message}\n"
+    print(log_entry, end='')
+    app_state["log_history"] += log_entry
+    return log_entry
+
 # --- LINE Messaging APIへの通知機能 ---
-def send_message(channel_token, user_id, message):
+def send_message(message):
     """単一のテキストメッセージをLINE Messaging API経由で送信する"""
+    settings = load_settings()
+    channel_token = settings.get("channel_token", "")
+    user_id = settings.get("user_id", "")
+    
+    if not channel_token or not user_id:
+        log_message("LINE設定が完了していません。通知を送信できません。", "ERROR")
+        return "LINE設定が完了していません"
+    
     push_api_url = 'https://api.line.me/v2/bot/message/push'
     headers = {
         'Content-Type': 'application/json',
@@ -66,50 +99,46 @@ def send_message(channel_token, user_id, message):
     except Exception as e:
         return f"LINEメッセージの送信に失敗: {e}"
 
-def send_long_message(channel_token, user_id, message):
+def send_long_message(message):
     """長文メッセージを分割して送信する"""
-    global app_state
-    max_length = 4800  # LINEのAPI制限より少し短く設定
+    max_length = 4800
     full_log = ""
 
     if len(message) <= max_length:
-        log = send_message(channel_token, user_id, message)
+        log = send_message(message)
         full_log += log + "\n"
     else:
-        # メッセージを分割
         parts = [message[i:i+max_length] for i in range(0, len(message), max_length)]
         for i, part in enumerate(parts):
-            # 分割したことを示すヘッダーを追加
             part_header = f"【{i+1}/{len(parts)}】\n"
-            log = send_message(channel_token, user_id, part_header + part)
+            log = send_message(part_header + part)
             full_log += log + "\n"
-            time.sleep(1) # API制限を避けるための短い待機
+            time.sleep(1)
             
-    app_state["log_history"] += full_log
+    log_message(f"LINE通知送信完了: {full_log}")
     return full_log
-
 
 # --- 個別のURLをチェックする関数 ---
 def perform_scrape_and_check(target: dict, page: Page):
     """単一のターゲットURLをスクレイピングし、変更をチェックして新しい内容を返す"""
-    global app_state
     url = target['url']
     mode = target['mode']
-    last_content = target.get('last_content', '') # Noneではなく空文字をデフォルトに
+    last_content = target.get('last_content', '')
     notify_on_check = target.get('notify_on_check', False)
-    attach_content = target.get('attach_content', False) # 新しいオプションを取得
-    
-    channel_token = target.get('channel_token')
-    user_id = target.get('user_id')
+    attach_content = target.get('attach_content', False)
+    enabled = target.get('enabled', True)
 
-    log_message = f"チェック中: {url}\n"
-    print(log_message)
-    app_state["log_history"] += log_message
+    # 無効なターゲットはスキップ
+    if not enabled:
+        log_message(f"スキップ (無効): {url}", "DEBUG")
+        return None
+
+    log_message(f"チェック開始: {url}", "INFO")
     
     new_content = ""
     try:
         page.goto(url, wait_until='domcontentloaded', timeout=60000)
-        time.sleep(10) # ページ描画のための共通待機時間
+        time.sleep(10)
 
         if mode == "エルメスモード (特定要素)":
             elements = page.locator('div.product-item').all_text_contents()
@@ -137,11 +166,8 @@ def perform_scrape_and_check(target: dict, page: Page):
             
         site_name = url.split('/')[2]
         
-        # last_contentがNoneの場合の初回実行
         if target.get('last_content') is None:
-            log_message = f"初回コンテンツ取得: {url}\n"
-            print(log_message)
-            app_state["log_history"] += log_message
+            log_message(f"初回コンテンツ取得: {url}", "INFO")
             if notify_on_check:
                 message = f"【監視開始】\nサイト「{site_name}」の監視を開始しました。\n{url}"
                 if attach_content:
@@ -149,12 +175,10 @@ def perform_scrape_and_check(target: dict, page: Page):
                     if mode not in ["通常モード (ページ全体)"] and new_content:
                         content_summary = f"\n\n--- 現在のアイテム一覧 ---\n{new_content}"
                     message = f"【監視開始】\nサイト「{site_name}」の監視を開始しました。{content_summary}\n\n{url}"
-                send_long_message(channel_token, user_id, message)
+                send_long_message(message)
 
         elif last_content != new_content:
-            log_message = f"変更を検知！: {url}\n"
-            print(log_message)
-            app_state["log_history"] += log_message
+            log_message(f"変更を検知: {url}", "WARNING")
             
             message = f"【更新通知】\nサイト「{site_name}」で変化を検知しました！\nすぐに確認してください！\n{url}"
             if attach_content:
@@ -163,7 +187,6 @@ def perform_scrape_and_check(target: dict, page: Page):
                 diff = difflib.unified_diff(
                     old_lines, new_lines, fromfile='変更前', tofile='変更後', lineterm=''
                 )
-                # --- と +++ ヘッダー行を除き、実際の変更行のみを抽出
                 diff_lines = [line for line in diff if line.startswith('+') or line.startswith('-')][2:]
                 diff_output = "\n".join(diff_lines)
 
@@ -180,12 +203,13 @@ def perform_scrape_and_check(target: dict, page: Page):
                         f"--- 変更箇所 ---\n{diff_output}\n\n"
                         f"すぐに確認してください！\n{url}"
                     )
-            send_long_message(channel_token, user_id, message)
+                log_message(f"差分内容: {diff_output}", "DEBUG")
+                print(diff_output)
+                print(message)
+            send_long_message(message)
 
         else:
-            log_message = f"変更なし: {url}\n"
-            print(log_message)
-            app_state["log_history"] += log_message
+            log_message(f"変更なし: {url}", "INFO")
             if notify_on_check:
                 message = f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。\n{url}"
                 if attach_content:
@@ -194,90 +218,149 @@ def perform_scrape_and_check(target: dict, page: Page):
                         top_items = "\n".join(new_content.split('\n')[:5])
                         summary_for_no_change = f"\n\n--- 最新上位5件 ---\n{top_items}"
                     message = f"【定期チェック完了】\nサイト「{site_name}」をチェックしました (変更なし)。{summary_for_no_change}\n\n{url}"
-                send_long_message(channel_token, user_id, message)
+                send_long_message(message)
         
         return new_content
 
-
     except Exception as e:
-        log_message = f"エラー発生 ({url}): {e}\n"
-        print(log_message)
-        app_state["log_history"] += log_message
+        log_message(f"エラー発生 ({url}): {e}", "ERROR")
         return None
 
 # --- 永続的な監視ループ ---
 def master_monitoring_loop():
     """アプリのバックグラウンドで永続的に実行されるマスターループ"""
-    global app_state
-    log_message = "監視マスタースレッドを開始しました。\n"
-    print(log_message)
-    app_state["log_history"] += log_message
+    log_message("監視マスタースレッドを開始しました", "INFO")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True) # 通常はヘッドレスで実行
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
              user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         )
         
         try:
-            while True:
+            while app_state["monitoring_active"]:
                 # チェックが必要なターゲットのリストを取得
                 targets_to_check = [
                     t for t in load_targets()
-                    if time.time() - t.get('last_checked', 0) > t['interval']
+                    if time.time() - t.get('last_checked', 0) > t['interval'] and t.get('enabled', True)
                 ]
+
+                if not targets_to_check:
+                    log_message("チェック対象なし、5秒待機", "DEBUG")
+                    time.sleep(5)
+                    continue
 
                 for target in targets_to_check:
                     page = context.new_page()
                     try:
-                        # スクレイピング処理（時間がかかる可能性がある）
                         new_content = perform_scrape_and_check(target, page)
                         
-                        # --- 競合回避のための修正 ---
-                        # 1. スクレイピング完了後、DBから最新のリストを再度読み込む
                         all_targets_now = load_targets()
-                        
-                        # 2. 最新のリストから更新対象のアイテムを探す
                         target_to_update = next((t for t in all_targets_now if t['id'] == target['id']), None)
 
-                        # 3. アイテムが見つからない場合：
-                        #    スクレイピング中にUIから削除されたことを意味するので、何もしない
                         if not target_to_update:
-                            log_message = f"ID {target['id']} はチェック中に削除されたため、更新をスキップします。\n"
-                            print(log_message)
-                            app_state["log_history"] += log_message
+                            log_message(f"ID {target['id']} はチェック中に削除されたため、更新をスキップ", "WARNING")
                             continue
 
-                        # 4. アイテムが見つかった場合、更新する
                         target_to_update['last_checked'] = time.time()
                         if new_content is not None:
                             target_to_update['last_content'] = new_content
                         
-                        # 5. 更新後のリスト全体をDBに保存する
                         save_targets(all_targets_now)
 
+                    except Exception as e:
+                        log_message(f"ターゲット処理中のエラー (ID {target.get('id', 'N/A')}): {e}", "ERROR")
                     finally:
                         page.close()
 
                 # 次のチェックサイクルまで待機
                 time.sleep(5)
+        except Exception as e:
+            log_message(f"監視ループで予期せぬエラー: {e}", "ERROR")
         finally:
             browser.close()
+            log_message("監視マスタースレッドを終了しました", "INFO")
+
+# --- 監視制御関数 ---
+def toggle_monitoring(action):
+    """監視を開始/停止する"""
+    if action == "stop":
+        app_state["monitoring_active"] = False
+        log_message("監視を停止しました", "INFO")
+        return "監視停止中"
+    else:
+        if not app_state["monitoring_active"]:
+            app_state["monitoring_active"] = True
+            # 新しいスレッドで監視を再開
+            monitor_thread = threading.Thread(target=master_monitoring_loop, daemon=True)
+            monitor_thread.start()
+            log_message("監視を再開しました", "INFO")
+        return "監視実行中"
+
+def toggle_target_status(target_id, action):
+    """特定のターゲットのステータスを変更する"""
+    targets = load_targets()
+    target = next((t for t in targets if t['id'] == target_id), None)
+    
+    if not target:
+        log_message(f"ID {target_id} が見つかりません", "ERROR")
+        return get_targets_as_dataframe()
+    
+    if action == "delete":
+        targets = [t for t in targets if t['id'] != target_id]
+        log_message(f"ID {target_id} を削除しました", "INFO")
+    elif action == "disable":
+        target['enabled'] = False
+        log_message(f"ID {target_id} を無効化しました", "INFO")
+    elif action == "enable":
+        target['enabled'] = True
+        log_message(f"ID {target_id} を有効化しました", "INFO")
+    
+    save_targets(targets)
+    return get_targets_as_dataframe()
+
+def save_line_settings(channel_token, user_id):
+    """LINE設定を保存する"""
+    settings = {"channel_token": channel_token, "user_id": user_id}
+    save_settings(settings)
+    log_message("LINE設定を保存しました", "INFO")
+    return "LINE設定を保存しました"
+
+def test_line_connection():
+    """LINE接続テスト"""
+    settings = load_settings()
+    channel_token = settings.get("channel_token", "")
+    user_id = settings.get("user_id", "")
+    
+    if not channel_token or not user_id:
+        return "LINE設定が完了していません"
+    
+    test_message = "【テスト通知】\nWeb監視ツールからのテスト通知です。\nこのメッセージが表示されれば設定は正常です。"
+    
+    result = send_message(test_message)
+    log_message(f"LINE接続テスト: {result}", "INFO")
+    return result
 
 # --- Gradio UIイベントハンドラ ---
-def add_target(url, channel_token, user_id, interval, mode, notify_on_check, attach_content):
+def add_target(url, interval, mode, notify_on_check, attach_content):
     """監視対象をJSONに追加する"""
-    if not all([url, channel_token, user_id, interval, mode]):
-        gr.Warning("すべてのフィールドを入力してください。")
+    if not all([url, interval, mode]):
+        log_message("必須フィールドを入力してください", "WARNING")
         return get_targets_as_dataframe()
     if not url.startswith('http'):
-        gr.Warning("有効なURLを入力してください。")
+        log_message("有効なURLを入力してください", "WARNING")
+        return get_targets_as_dataframe()
+
+    # LINE設定の確認
+    settings = load_settings()
+    if not settings.get("channel_token") or not settings.get("user_id"):
+        log_message("LINE設定が完了していません。設定タブでLINE設定を完了させてください", "ERROR")
         return get_targets_as_dataframe()
 
     targets = load_targets()
     
     if any(t['url'] == url for t in targets):
-        gr.Warning("このURLは既に追加されています。")
+        log_message("このURLは既に追加されています", "WARNING")
         return get_targets_as_dataframe()
 
     new_id = max([t['id'] for t in targets] + [0]) + 1
@@ -285,50 +368,25 @@ def add_target(url, channel_token, user_id, interval, mode, notify_on_check, att
     new_target = {
         "id": new_id,
         "url": url,
-        "channel_token": channel_token,
-        "user_id": user_id,
         "mode": mode,
         "interval": int(interval),
         "notify_on_check": notify_on_check,
-        "attach_content": attach_content, # オプションを保存
+        "attach_content": attach_content,
+        "enabled": True,
         "last_content": None,
         "last_checked": 0
     }
     targets.append(new_target)
     save_targets(targets)
-    gr.Info(f"監視対象を追加しました: {url}")
+    log_message(f"監視対象を追加しました: {url}", "INFO")
     
-    return get_targets_as_dataframe()
-
-def delete_target_by_id(target_id_to_delete):
-    """指定されたIDの監視対象を削除する"""
-    if target_id_to_delete is None or target_id_to_delete == '':
-        gr.Warning("削除するIDを入力してください。")
-        return get_targets_as_dataframe()
-    
-    try:
-        target_id_to_delete_int = int(target_id_to_delete)
-    except (ValueError, TypeError):
-        gr.Warning("IDは数値で入力してください。")
-        return get_targets_as_dataframe()
-        
-    targets = load_targets()
-    
-    new_targets = [t for t in targets if t['id'] != target_id_to_delete_int]
-    
-    if len(new_targets) == len(targets):
-        gr.Warning(f"ID {target_id_to_delete_int} が見つかりませんでした。")
-    else:
-        save_targets(new_targets)
-        gr.Info(f"ID {target_id_to_delete_int} を削除しました。")
-        
     return get_targets_as_dataframe()
 
 def get_targets_as_dataframe():
     """JSONから現在の監視リストを取得し、DataFrameとして返す"""
     targets = load_targets()
     if not targets:
-        return pd.DataFrame(columns=['ID', 'URL', 'モード', '間隔(秒)', '最終チェック日時', '毎回通知', '内容を添付'])
+        return pd.DataFrame(columns=['ID', 'URL', 'モード', '間隔(秒)', 'ステータス', '最終チェック日時', '毎回通知', '内容を添付', '操作'])
 
     df = pd.DataFrame(targets)
     # 古いデータとの互換性
@@ -336,20 +394,28 @@ def get_targets_as_dataframe():
         df['notify_on_check'] = False
     if 'attach_content' not in df.columns:
         df['attach_content'] = False
+    if 'enabled' not in df.columns:
+        df['enabled'] = True
 
-    df = df[['id', 'url', 'mode', 'interval', 'last_checked', 'notify_on_check', 'attach_content']]
+    df = df[['id', 'url', 'mode', 'interval', 'enabled', 'last_checked', 'notify_on_check', 'attach_content']]
     df['last_checked'] = df['last_checked'].apply(
-        lambda ts: datetime.fromtimestamp(ts).strftime('%Y-m-%d %H:%M:%S') if ts > 0 else "未チェック"
+        lambda ts: datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts > 0 else "未チェック"
     )
     df['notify_on_check'] = df['notify_on_check'].apply(lambda x: "はい" if x else "いいえ")
     df['attach_content'] = df['attach_content'].apply(lambda x: "はい" if x else "いいえ")
+    df['enabled'] = df['enabled'].apply(lambda x: "有効" if x else "無効")
+    
+    # 操作ボタンのための列を追加
+    df['操作'] = df['id'].apply(lambda x: f"{x}")
     
     df.rename(columns={
         'id':'ID', 'url':'URL', 'mode':'モード', 
-        'interval':'間隔(秒)', 'last_checked':'最終チェック日時',
+        'interval':'間隔(秒)', 'enabled': 'ステータス',
+        'last_checked':'最終チェック日時',
         'notify_on_check': '毎回通知',
         'attach_content': '内容を添付'
     }, inplace=True)
+    
     return df
 
 def get_logs():
@@ -362,83 +428,121 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Web更新通知ツール") as app:
     gr.Markdown("# Webサイト更新通知ツール (Messaging API版)")
     gr.Markdown("複数の監視対象を登録でき、ブラウザを閉じても監視を継続します。")
 
-    with gr.Row():
-        with gr.Column(scale=2):
-            gr.Markdown("### 監視リスト")
-            targets_display = gr.DataFrame(
-                value=get_targets_as_dataframe, 
-                interactive=False
-            )
-            refresh_btn = gr.Button("リストを手動更新")
-            
-            with gr.Accordion("新しい監視対象を追加", open=True):
-                url_input = gr.Textbox(label="監視対象URL", placeholder="https://www.hermes.com/jp/ja/...")
-                channel_token_input = gr.Textbox(label="LINE Channel Access Token", type="password", placeholder="LINE Developersコンソールから発行した長期トークン")
-                user_id_input = gr.Textbox(label="LINE User ID", placeholder="あなたのユーザーID (Uから始まる文字列)")
+    with gr.Tab("監視設定"):
+        with gr.Row():
+            with gr.Column(scale=2):
+                # 監視制御ボタン
                 with gr.Row():
-                    interval_input = gr.Slider(minimum=10, maximum=1800, value=600, step=10, label="監視間隔 (秒)")
-                    mode_input = gr.Radio(
-                        ["通常モード (ページ全体)", "エルメスモード (特定要素)", "メルカリモード (商品リスト)", "Amazonモード (aria-label)", "楽天モード (a-title)", "Yahooショッピングモード (span-content)"], 
-                        label="監視モード", 
-                        value="通常モード (ページ全体)"
-                    )
-                with gr.Row():
-                    notify_on_check_input = gr.Checkbox(label="チェック毎に通知する")
-                    attach_content_input = gr.Checkbox(label="通知に内容を添付する", value=True) # UIにチェックボックスを追加
+                    monitor_status = gr.Label(value="監視実行中", label="監視ステータス")
+                    stop_btn = gr.Button("監視停止", variant="stop")
+                    start_btn = gr.Button("監視開始", variant="primary")
                 
-                add_btn = gr.Button("リストに追加", variant="primary")
+                gr.Markdown("### 監視リスト")
+                
+                # 操作ボタン付きのテーブル表示
+                with gr.Row():
+                    targets_display = gr.DataFrame(
+                        value=get_targets_as_dataframe, 
+                        interactive=False,
+                        elem_id="targets_table",
+                        scale=4
+                    )
+                    
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 個別操作")
+                        target_id_input = gr.Number(label="操作対象のID", precision=0)
+                        with gr.Row():
+                            enable_btn = gr.Button("有効化", variant="primary")
+                            disable_btn = gr.Button("無効化", variant="secondary")
+                        delete_btn = gr.Button("削除", variant="stop")
+                        gr.Markdown("※テーブルのIDを確認して入力してください")
+                
+                refresh_btn = gr.Button("リストを手動更新")
+                
+                with gr.Accordion("新しい監視対象を追加", open=True):
+                    url_input = gr.Textbox(label="監視対象URL", placeholder="https://www.hermes.com/jp/ja/...")
+                    with gr.Row():
+                        interval_input = gr.Slider(minimum=10, maximum=1800, value=600, step=10, label="監視間隔 (秒)")
+                        mode_input = gr.Radio(
+                            ["通常モード (ページ全体)", "エルメスモード (特定要素)", "メルカリモード (商品リスト)", "Amazonモード (aria-label)", "楽天モード (a-title)", "Yahooショッピングモード (span-content)"], 
+                            label="監視モード", 
+                            value="通常モード (ページ全体)"
+                        )
+                    with gr.Row():
+                        notify_on_check_input = gr.Checkbox(label="チェック毎に通知する")
+                        attach_content_input = gr.Checkbox(label="通知に内容を添付する", value=True)
+                    
+                    add_btn = gr.Button("リストに追加", variant="primary")
 
-            with gr.Accordion("監視対象を削除", open=False):
-                delete_id_input = gr.Number(label="削除したい項目のIDを入力してください", precision=0)
-                delete_btn = gr.Button("このIDの項目を削除", variant="stop")
+            with gr.Column(scale=1):
+                gr.Markdown("### 実行ログ")
+                log_output = gr.Textbox(label=" ", lines=25, interactive=False, autoscroll=True)
 
-        with gr.Column(scale=1):
-            gr.Markdown("### 実行ログ")
-            log_output = gr.Textbox(label=" ", lines=25, interactive=False, autoscroll=True)
+    with gr.Tab("LINE設定"):
+        gr.Markdown("### LINE通知設定")
+        gr.Markdown("ここで設定したLINEアカウントにすべての通知が送信されます。")
+        
+        settings = load_settings()
+        line_token_input = gr.Textbox(
+            label="LINE Channel Access Token", 
+            value=settings.get("channel_token", ""),
+            type="password", 
+            placeholder="LINE Developersコンソールから発行した長期トークン"
+        )
+        line_user_id_input = gr.Textbox(
+            label="LINE User ID", 
+            value=settings.get("user_id", ""),
+            placeholder="あなたのユーザーID (Uから始まる文字列)"
+        )
+        
+        with gr.Row():
+            save_line_btn = gr.Button("LINE設定を保存", variant="primary")
+            test_line_btn = gr.Button("接続テスト", variant="secondary")
+        
+        line_status = gr.Textbox(label="ステータス", interactive=False)
+        
+        # LINE設定のイベントハンドラ
+        save_line_btn.click(
+            fn=save_line_settings,
+            inputs=[line_token_input, line_user_id_input],
+            outputs=[line_status]
+        )
+        test_line_btn.click(
+            fn=test_line_connection,
+            inputs=[],
+            outputs=[line_status]
+        )
 
     # イベントリスナー
     add_btn.click(
         fn=add_target,
-        inputs=[url_input, channel_token_input, user_id_input, interval_input, mode_input, notify_on_check_input, attach_content_input],
+        inputs=[url_input, interval_input, mode_input, notify_on_check_input, attach_content_input],
         outputs=[targets_display]
     )
-    delete_btn.click(fn=delete_target_by_id, inputs=[delete_id_input], outputs=[targets_display])
+    stop_btn.click(fn=toggle_monitoring, inputs=gr.State("stop"), outputs=[monitor_status])
+    start_btn.click(fn=toggle_monitoring, inputs=gr.State("start"), outputs=[monitor_status])
+    disable_btn.click(fn=toggle_target_status, inputs=[target_id_input, gr.State("disable")], outputs=[targets_display])
+    enable_btn.click(fn=toggle_target_status, inputs=[target_id_input, gr.State("enable")], outputs=[targets_display])
+    delete_btn.click(fn=toggle_target_status, inputs=[target_id_input, gr.State("delete")], outputs=[targets_display])
     refresh_btn.click(fn=get_targets_as_dataframe, inputs=None, outputs=[targets_display])
     
-    # --- 定期的な更新処理 ---
-    # 2秒ごとにログを更新
+    # 定期的な更新処理
     gr.Timer(2).tick(get_logs, None, log_output)
-    # 10秒ごとに監視リストのDataFrameを更新
     gr.Timer(10).tick(get_targets_as_dataframe, None, targets_display)
-
 
 # --- アプリケーションの起動 ---
 if __name__ == "__main__":
-    # Docker環境では、PlaywrightのインストールはDockerfileで行うため、
-    # このPythonスクリプト内でのインストール処理は不要です。
-
     print("JSONデータベースを初期化します...")
     init_json_db()
     print("初期化が完了しました。")
 
+    # 初期ログメッセージ
+    log_message("アプリを起動しました", "INFO")
+    
     # バックグラウンドで監視スレッドを開始
+    app_state["monitoring_active"] = True
     monitor_thread = threading.Thread(target=master_monitoring_loop, daemon=True)
     monitor_thread.start()
     
-    # --- Dockerのための起動設定 ---
-    # Dockerfileと合わせて、以下のコマンドでコンテナを起動します。
-    # 1. イメージのビルド:
-    #    docker build -t web-monitor-app .
-    #
-    # 2. コンテナの起動 (データ永続化のためボリュームを使用):
-    #    docker run -d -p 7860:7860 -v "$(pwd)/my_data:/data" --name web-monitor web-monitor-app
-    #    - "-d": バックグラウンドで実行
-    #    - "-p 7860:7860": ホストのポート7860をコンテナのポート7860にマッピング
-    #    - "-v "$(pwd)/my_data:/data"": ホストのカレントディレクトリ下の'my_data'フォルダを
-    #      コンテナの'/data'ディレクトリにマッピングします。
-    #      'my_data'フォルダは自動で作成されます。ここに'monitoring_db.json'が保存されます。
-    
     print("Gradioアプリを起動します...")
-    # コンテナ内で外部からのアクセスを受け付けるために server_name="0.0.0.0" を指定
-    # ポートはGradioのデフォルト(7860)を使用
     app.launch(server_name="0.0.0.0", server_port=int(os.getenv('PORT', 7860)))
